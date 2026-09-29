@@ -548,9 +548,10 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, max_output_tokens: int | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self.max_output_tokens = max_output_tokens    # deployment limit; absent keeps Strata's normal behavior
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
@@ -738,11 +739,13 @@ class Service:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
+        if self.max_output_tokens is not None and max_new is not None and max_new > self.max_output_tokens:
+            raise ValueError(f"max tokens ({max_new}) exceeds the server output cap ({self.max_output_tokens})")
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({self.engine.max_context}); requests are never truncated")
-            max_new = room
+            max_new = min(room, self.max_output_tokens) if self.max_output_tokens is not None else room
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
@@ -1295,7 +1298,8 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
+                self._json(200, {"status": "ok", "max_context": svc.engine.max_context,
+                                 "max_output_tokens": svc.max_output_tokens, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key)})
             elif path == "/status":
                 with svc.status_lock:
@@ -1366,7 +1370,9 @@ def make_handler(svc: Service):
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
-            params["n_predict"] = svc.shared.get("max_tokens", -1)
+            requested_default = svc.shared.get("max_tokens", svc.max_output_tokens or -1)
+            params["n_predict"] = (min(requested_default, svc.max_output_tokens)
+                                    if svc.max_output_tokens is not None else requested_default)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": False,
@@ -1661,6 +1667,9 @@ def main() -> int:
                                          "the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    max_output_tokens = cfg.get("max_output_tokens")
+    if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+        ap.error("max_output_tokens in the config must be a positive integer")
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -1711,7 +1720,8 @@ def main() -> int:
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
+                  max_output_tokens=max_output_tokens)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)

@@ -128,6 +128,46 @@ class MaxTokens(unittest.TestCase):
             del os.environ["STRATA_DEBUG"]
 
 
+class OutputCap(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          max_output_tokens=64)
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = MaxTokens.post
+    call = MaxTokens.call
+
+    def test_default_explicit_and_rejected_budgets(self):
+        for api in ("openai", "anthropic"):
+            with self.subTest(api=api):
+                status, body, _, count = self.call(api)
+                self.assertEqual(status, 200, body)
+                self.assertEqual((self.engine.last_max_new, count), (64, 64))
+                status, body, _, count = self.call(api, max_tokens=32)
+                self.assertEqual(status, 200, body)
+                self.assertEqual((self.engine.last_max_new, count), (32, 32))
+                status, body, _, _ = self.call(api, max_tokens=65)
+                self.assertEqual(status, 400, body)
+                self.assertIn("output cap (64)", body["error"]["message"])
+        status, body, _, _ = self.call("openai", max_completion_tokens=65)
+        self.assertEqual(status, 400, body)
+
+    def test_discovery_reports_the_limit(self):
+        with urllib.request.urlopen(self.base + "/health", timeout=5) as response:
+            self.assertEqual(json.load(response)["max_output_tokens"], 64)
+        with urllib.request.urlopen(self.base + "/props", timeout=5) as response:
+            self.assertEqual(json.load(response)["default_generation_settings"]["params"]["n_predict"], 64)
+
+
 class FitMaxTokens(unittest.TestCase):
     """PR #24: --fit-max-tokens clamps an explicit budget that overshoots the context instead of a 400."""
 
